@@ -1,0 +1,15 @@
+Time,User,Src_IP,Action,Outcome,Host
+2026-03-09T09:00:01Z,alice,10.20.1.11,login,Success,vpn-gw-01
+2026-03-09T10:00:00Z,demo_user,198.51.100.50,login,FAILED,vpn-gw-01
+2026-03-09T10:00:20Z,demo_user,198.51.100.50,login,FAILED,vpn-gw-01
+2026-03-09T10:00:40Z,demo_user,198.51.100.50,login,FAILED,vpn-gw-01
+2026-03-09T10:01:00Z,demo_user,198.51.100.50,login,FAILED,vpn-gw-01
+2026-03-09T10:01:20Z,demo_user,198.51.100.50,login,FAILED,vpn-gw-01
+2026-03-09T10:01:40Z,demo_user,198.51.100.50,login,FAILED,vpn-gw-01
+2026-03-09T10:01:40Z,demo_user,198.51.100.50,login,FAILED,vpn-gw-01
+2026-03-09T10:02:10Z,demo_user,198.51.100.50,login,Success,vpn-gw-01
+not-a-date,alice,10.20.1.11,login,Success,vpn-gw-01
+2026-03-09T11:00:00Z,,10.20.1.12,login,Success,vpn-gw-01
+2026-03-09T11:05:00Z,bruno,999.1.1.1,login,Success,vpn-gw-01
+2026-03-09T11:10:00Z,carla,10.20.1.13,login,maybe,vpn-gw-01
+2026-03-09T11:15:00Z,diego,10.20.2.21,login,Success,vpn-gw-01,unexpected,extra,fields

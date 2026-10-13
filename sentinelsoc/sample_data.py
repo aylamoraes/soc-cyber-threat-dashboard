@@ -1,0 +1,478 @@
+"""Deterministic generator for the synthetic authentication logs in ``data/``.
+
+The sample files are committed so the tests can run offline and so the
+dashboard has data without any setup. This module is the single source of truth
+for those files: :func:`write_samples` regenerates them from the embedded event
+table, and the test suite checks the output matches the committed bytes exactly.
+
+Run it to (re)create the samples in ``data/``::
+
+    python -m sentinelsoc.sample_data
+"""
+
+from __future__ import annotations
+
+import csv
+import io
+import json
+from pathlib import Path
+
+FIELDS = ("timestamp", "username", "source_ip", "event_type", "status", "hostname", "service")
+
+# Each tuple mirrors one CSV/JSON record, in file order. Kept as plain tuples so
+# the module stays compact and the output is byte-for-byte reproducible.
+_EVENTS = [
+    ('2026-03-09T01:00:02Z', 'svc_backup', '10.20.9.20', 'login', 'success', 'bastion-01', 'ssh'),
+    ('2026-03-09T01:02:02Z', 'svc_backup', '10.20.9.20', 'file_access', 'success', 'fs-01', 'fileshare'),
+    ('2026-03-09T01:30:02Z', 'svc_backup', '10.20.9.20', 'logout', 'success', 'bastion-01', 'ssh'),
+    ('2026-03-09T02:14:05Z', 'admin', '203.0.113.45', 'login', 'failure', 'bastion-01', 'ssh'),
+    ('2026-03-09T02:14:25Z', 'admin', '203.0.113.45', 'login', 'failure', 'bastion-01', 'ssh'),
+    ('2026-03-09T02:14:45Z', 'admin', '203.0.113.45', 'login', 'failure', 'bastion-01', 'ssh'),
+    ('2026-03-09T02:15:05Z', 'admin', '203.0.113.45', 'login', 'failure', 'bastion-01', 'ssh'),
+    ('2026-03-09T02:15:25Z', 'admin', '203.0.113.45', 'login', 'failure', 'bastion-01', 'ssh'),
+    ('2026-03-09T02:15:45Z', 'admin', '203.0.113.45', 'login', 'failure', 'bastion-01', 'ssh'),
+    ('2026-03-09T02:16:05Z', 'admin', '203.0.113.45', 'login', 'failure', 'bastion-01', 'ssh'),
+    ('2026-03-09T02:16:25Z', 'admin', '203.0.113.45', 'login', 'failure', 'bastion-01', 'ssh'),
+    ('2026-03-09T02:16:45Z', 'admin', '203.0.113.45', 'login', 'failure', 'bastion-01', 'ssh'),
+    ('2026-03-09T02:17:05Z', 'admin', '203.0.113.45', 'login', 'failure', 'bastion-01', 'ssh'),
+    ('2026-03-09T02:17:25Z', 'admin', '203.0.113.45', 'login', 'failure', 'bastion-01', 'ssh'),
+    ('2026-03-09T02:17:45Z', 'admin', '203.0.113.45', 'login', 'failure', 'bastion-01', 'ssh'),
+    ('2026-03-09T02:18:05Z', 'admin', '203.0.113.45', 'login', 'failure', 'bastion-01', 'ssh'),
+    ('2026-03-09T02:18:25Z', 'admin', '203.0.113.45', 'login', 'failure', 'bastion-01', 'ssh'),
+    ('2026-03-09T02:18:45Z', 'admin', '203.0.113.45', 'login', 'failure', 'bastion-01', 'ssh'),
+    ('2026-03-09T02:19:05Z', 'admin', '203.0.113.45', 'login', 'failure', 'bastion-01', 'ssh'),
+    ('2026-03-09T02:19:25Z', 'admin', '203.0.113.45', 'login', 'failure', 'bastion-01', 'ssh'),
+    ('2026-03-09T02:19:45Z', 'admin', '203.0.113.45', 'login', 'failure', 'bastion-01', 'ssh'),
+    ('2026-03-09T08:20:47Z', 'helpdesk', '10.20.5.8', 'login', 'success', 'mail-01', 'webmail'),
+    ('2026-03-09T08:25:28Z', 'elena', '10.20.2.22', 'login', 'failure', 'mail-01', 'webmail'),
+    ('2026-03-09T08:25:49Z', 'elena', '10.20.2.22', 'login', 'success', 'mail-01', 'webmail'),
+    ('2026-03-09T08:26:47Z', 'helpdesk', '10.20.5.8', 'file_access', 'success', 'fs-01', 'fileshare'),
+    ('2026-03-09T08:28:06Z', 'lucia', '10.20.4.43', 'login', 'failure', 'vpn-gw-01', 'vpn'),
+    ('2026-03-09T08:28:31Z', 'lucia', '10.20.4.43', 'login', 'success', 'vpn-gw-01', 'vpn'),
+    ('2026-03-09T08:34:45Z', 'diego', '10.20.2.21', 'login', 'success', 'rdp-gw-01', 'rdp'),
+    ('2026-03-09T08:51:31Z', 'lucia', '10.20.4.43', 'file_access', 'success', 'fs-01', 'fileshare'),
+    ('2026-03-09T09:04:31Z', 'lucia', '10.20.4.43', 'file_access', 'success', 'fs-01', 'fileshare'),
+    ('2026-03-09T09:08:45Z', 'diego', '10.20.2.21', 'file_access', 'success', 'fs-01', 'fileshare'),
+    ('2026-03-09T09:08:53Z', 'carla', '10.20.1.13', 'login', 'success', 'vpn-gw-01', 'vpn'),
+    ('2026-03-09T09:24:22Z', 'hugo', '10.20.3.32', 'login', 'success', 'rdp-gw-01', 'rdp'),
+    ('2026-03-09T09:28:22Z', 'hugo', '10.20.3.32', 'file_access', 'success', 'fs-01', 'fileshare'),
+    ('2026-03-09T09:31:55Z', 'alice', '10.20.1.11', 'login', 'success', 'vpn-gw-01', 'vpn'),
+    ('2026-03-09T09:35:54Z', 'bruno', '10.20.1.12', 'login', 'failure', 'mail-01', 'webmail'),
+    ('2026-03-09T09:36:45Z', 'bruno', '10.20.1.12', 'login', 'success', 'mail-01', 'webmail'),
+    ('2026-03-09T09:46:00Z', 'jonas', '10.20.4.41', 'login', 'success', 'mail-01', 'webmail'),
+    ('2026-03-09T09:49:53Z', 'carla', '10.20.1.13', 'file_access', 'success', 'fs-01', 'fileshare'),
+    ('2026-03-09T09:57:00Z', 'jonas', '10.20.4.41', 'file_access', 'success', 'fs-01', 'fileshare'),
+    ('2026-03-09T09:57:50Z', 'gina', '10.20.3.31', 'login', 'success', 'mail-01', 'webmail'),
+    ('2026-03-09T10:00:53Z', 'carla', '10.20.1.13', 'file_access', 'failure', 'fs-01', 'fileshare'),
+    ('2026-03-09T10:02:46Z', 'karim', '10.20.4.42', 'login', 'success', 'rdp-gw-01', 'rdp'),
+    ('2026-03-09T10:03:18Z', 'farid', '10.20.2.23', 'login', 'success', 'vpn-gw-01', 'vpn'),
+    ('2026-03-09T10:05:22Z', 'hugo', '10.20.3.32', 'file_access', 'success', 'fs-01', 'fileshare'),
+    ('2026-03-09T10:07:49Z', 'elena', '10.20.2.22', 'file_access', 'success', 'fs-01', 'fileshare'),
+    ('2026-03-09T10:09:47Z', 'helpdesk', '10.20.5.8', 'file_access', 'success', 'fs-01', 'fileshare'),
+    ('2026-03-09T10:10:45Z', 'bruno', '10.20.1.12', 'file_access', 'success', 'fs-01', 'fileshare'),
+    ('2026-03-09T10:11:45Z', 'bruno', '10.20.1.12', 'file_access', 'success', 'fs-01', 'fileshare'),
+    ('2026-03-09T10:11:53Z', 'carla', '10.20.1.13', 'file_access', 'success', 'fs-01', 'fileshare'),
+    ('2026-03-09T10:12:55Z', 'alice', '10.20.1.11', 'file_access', 'success', 'fs-01', 'fileshare'),
+    ('2026-03-09T10:18:00Z', 'jonas', '10.20.4.41', 'file_access', 'success', 'fs-01', 'fileshare'),
+    ('2026-03-09T10:22:20Z', 'admin', '10.20.9.5', 'login', 'success', 'bastion-01', 'ssh'),
+    ('2026-03-09T10:23:53Z', 'carla', '10.20.1.13', 'file_access', 'success', 'fs-01', 'fileshare'),
+    ('2026-03-09T10:24:22Z', 'hugo', '10.20.3.32', 'file_access', 'success', 'fs-01', 'fileshare'),
+    ('2026-03-09T10:25:47Z', 'helpdesk', '10.20.5.8', 'file_access', 'success', 'fs-01', 'fileshare'),
+    ('2026-03-09T10:29:20Z', 'admin', '10.20.9.5', 'file_access', 'success', 'fs-01', 'fileshare'),
+    ('2026-03-09T10:29:46Z', 'karim', '10.20.4.42', 'file_access', 'success', 'fs-01', 'fileshare'),
+    ('2026-03-09T10:30:30Z', 'irene', '10.20.3.33', 'login', 'success', 'vpn-gw-01', 'vpn'),
+    ('2026-03-09T10:35:31Z', 'lucia', '10.20.4.43', 'file_access', 'success', 'fs-01', 'fileshare'),
+    ('2026-03-09T10:40:18Z', 'farid', '10.20.2.23', 'file_access', 'success', 'fs-01', 'fileshare'),
+    ('2026-03-09T10:41:22Z', 'hugo', '10.20.3.32', 'file_access', 'success', 'fs-01', 'fileshare'),
+    ('2026-03-09T10:41:50Z', 'gina', '10.20.3.31', 'file_access', 'success', 'fs-01', 'fileshare'),
+    ('2026-03-09T10:44:45Z', 'diego', '10.20.2.21', 'file_access', 'failure', 'fs-01', 'fileshare'),
+    ('2026-03-09T10:51:31Z', 'lucia', '10.20.4.43', 'file_access', 'success', 'fs-01', 'fileshare'),
+    ('2026-03-09T10:55:18Z', 'farid', '10.20.2.23', 'file_access', 'success', 'fs-01', 'fileshare'),
+    ('2026-03-09T10:55:55Z', 'alice', '10.20.1.11', 'file_access', 'success', 'fs-01', 'fileshare'),
+    ('2026-03-09T10:57:50Z', 'gina', '10.20.3.31', 'file_access', 'success', 'fs-01', 'fileshare'),
+    ('2026-03-09T10:57:55Z', 'alice', '10.20.1.11', 'file_access', 'success', 'fs-01', 'fileshare'),
+    ('2026-03-09T11:01:31Z', 'lucia', '10.20.4.43', 'file_access', 'success', 'fs-01', 'fileshare'),
+    ('2026-03-09T11:01:49Z', 'elena', '10.20.2.22', 'file_access', 'success', 'fs-01', 'fileshare'),
+    ('2026-03-09T11:08:31Z', 'lucia', '10.20.4.43', 'file_access', 'success', 'fs-01', 'fileshare'),
+    ('2026-03-09T11:09:47Z', 'helpdesk', '10.20.5.8', 'file_access', 'success', 'fs-01', 'fileshare'),
+    ('2026-03-09T11:11:30Z', 'irene', '10.20.3.33', 'file_access', 'success', 'fs-01', 'fileshare'),
+    ('2026-03-09T11:16:50Z', 'gina', '10.20.3.31', 'file_access', 'success', 'fs-01', 'fileshare'),
+    ('2026-03-09T11:17:46Z', 'karim', '10.20.4.42', 'file_access', 'success', 'fs-01', 'fileshare'),
+    ('2026-03-09T11:22:31Z', 'lucia', '10.20.4.43', 'file_access', 'success', 'fs-01', 'fileshare'),
+    ('2026-03-09T11:23:50Z', 'gina', '10.20.3.31', 'file_access', 'success', 'fs-01', 'fileshare'),
+    ('2026-03-09T11:27:22Z', 'hugo', '10.20.3.32', 'file_access', 'success', 'fs-01', 'fileshare'),
+    ('2026-03-09T11:27:55Z', 'alice', '10.20.1.11', 'file_access', 'success', 'fs-01', 'fileshare'),
+    ('2026-03-09T11:31:30Z', 'irene', '10.20.3.33', 'file_access', 'success', 'fs-01', 'fileshare'),
+    ('2026-03-09T11:32:22Z', 'hugo', '10.20.3.32', 'file_access', 'success', 'fs-01', 'fileshare'),
+    ('2026-03-09T11:32:50Z', 'gina', '10.20.3.31', 'password_change', 'success', 'mail-01', 'webmail'),
+    ('2026-03-09T11:39:55Z', 'alice', '10.20.1.11', 'file_access', 'success', 'fs-01', 'fileshare'),
+    ('2026-03-09T11:42:46Z', 'karim', '10.20.4.42', 'file_access', 'failure', 'fs-01', 'fileshare'),
+    ('2026-03-09T11:43:55Z', 'alice', '10.20.1.11', 'file_access', 'success', 'fs-01', 'fileshare'),
+    ('2026-03-09T11:46:20Z', 'admin', '10.20.9.5', 'file_access', 'success', 'fs-01', 'fileshare'),
+    ('2026-03-09T11:49:45Z', 'diego', '10.20.2.21', 'file_access', 'success', 'fs-01', 'fileshare'),
+    ('2026-03-09T12:08:45Z', 'bruno', '10.20.1.12', 'file_access', 'success', 'fs-01', 'fileshare'),
+    ('2026-03-09T12:10:30Z', 'irene', '10.20.3.33', 'file_access', 'success', 'fs-01', 'fileshare'),
+    ('2026-03-09T12:10:55Z', 'alice', '10.20.1.11', 'file_access', 'success', 'fs-01', 'fileshare'),
+    ('2026-03-09T12:19:00Z', 'jonas', '10.20.4.41', 'file_access', 'success', 'fs-01', 'fileshare'),
+    ('2026-03-09T12:20:45Z', 'bruno', '10.20.1.12', 'file_access', 'success', 'fs-01', 'fileshare'),
+    ('2026-03-09T12:22:55Z', 'alice', '10.20.1.11', 'file_access', 'success', 'fs-01', 'fileshare'),
+    ('2026-03-09T12:23:50Z', 'gina', '10.20.3.31', 'file_access', 'success', 'fs-01', 'fileshare'),
+    ('2026-03-09T12:28:46Z', 'karim', '10.20.4.42', 'file_access', 'success', 'fs-01', 'fileshare'),
+    ('2026-03-09T12:33:18Z', 'farid', '10.20.2.23', 'file_access', 'success', 'fs-01', 'fileshare'),
+    ('2026-03-09T12:35:53Z', 'carla', '10.20.1.13', 'file_access', 'success', 'fs-01', 'fileshare'),
+    ('2026-03-09T12:38:45Z', 'diego', '10.20.2.21', 'file_access', 'failure', 'fs-01', 'fileshare'),
+    ('2026-03-09T12:39:50Z', 'gina', '10.20.3.31', 'file_access', 'success', 'fs-01', 'fileshare'),
+    ('2026-03-09T12:42:53Z', 'carla', '10.20.1.13', 'file_access', 'success', 'fs-01', 'fileshare'),
+    ('2026-03-09T12:51:45Z', 'bruno', '10.20.1.12', 'file_access', 'success', 'fs-01', 'fileshare'),
+    ('2026-03-09T12:55:49Z', 'elena', '10.20.2.22', 'file_access', 'success', 'fs-01', 'fileshare'),
+    ('2026-03-09T12:57:18Z', 'farid', '10.20.2.23', 'file_access', 'success', 'fs-01', 'fileshare'),
+    ('2026-03-09T12:59:45Z', 'bruno', '10.20.1.12', 'file_access', 'success', 'fs-01', 'fileshare'),
+    ('2026-03-09T13:00:22Z', 'hugo', '10.20.3.32', 'file_access', 'success', 'fs-01', 'fileshare'),
+    ('2026-03-09T13:03:31Z', 'lucia', '10.20.4.43', 'file_access', 'success', 'fs-01', 'fileshare'),
+    ('2026-03-09T13:14:00Z', 'jonas', '10.20.4.41', 'file_access', 'success', 'fs-01', 'fileshare'),
+    ('2026-03-09T13:17:46Z', 'karim', '10.20.4.42', 'file_access', 'success', 'fs-01', 'fileshare'),
+    ('2026-03-09T13:18:18Z', 'farid', '10.20.2.23', 'file_access', 'success', 'fs-01', 'fileshare'),
+    ('2026-03-09T13:18:53Z', 'carla', '10.20.1.13', 'file_access', 'success', 'fs-01', 'fileshare'),
+    ('2026-03-09T13:22:22Z', 'hugo', '10.20.3.32', 'file_access', 'success', 'fs-01', 'fileshare'),
+    ('2026-03-09T13:22:49Z', 'elena', '10.20.2.22', 'file_access', 'success', 'fs-01', 'fileshare'),
+    ('2026-03-09T13:23:45Z', 'bruno', '10.20.1.12', 'file_access', 'success', 'fs-01', 'fileshare'),
+    ('2026-03-09T13:26:45Z', 'bruno', '10.20.1.12', 'file_access', 'success', 'fs-01', 'fileshare'),
+    ('2026-03-09T13:27:45Z', 'diego', '10.20.2.21', 'file_access', 'success', 'fs-01', 'fileshare'),
+    ('2026-03-09T13:29:31Z', 'lucia', '10.20.4.43', 'file_access', 'success', 'fs-01', 'fileshare'),
+    ('2026-03-09T13:29:45Z', 'bruno', '10.20.1.12', 'file_access', 'success', 'fs-01', 'fileshare'),
+    ('2026-03-09T13:30:45Z', 'diego', '10.20.2.21', 'file_access', 'success', 'fs-01', 'fileshare'),
+    ('2026-03-09T13:32:45Z', 'diego', '10.20.2.21', 'file_access', 'failure', 'fs-01', 'fileshare'),
+    ('2026-03-09T13:34:46Z', 'karim', '10.20.4.42', 'file_access', 'failure', 'fs-01', 'fileshare'),
+    ('2026-03-09T13:37:50Z', 'gina', '10.20.3.31', 'file_access', 'success', 'fs-01', 'fileshare'),
+    ('2026-03-09T13:40:00Z', 'carla', '198.51.100.77', 'login', 'failure', 'vpn-gw-01', 'vpn'),
+    ('2026-03-09T13:40:20Z', 'carla', '198.51.100.77', 'login', 'failure', 'vpn-gw-01', 'vpn'),
+    ('2026-03-09T13:40:40Z', 'carla', '198.51.100.77', 'login', 'failure', 'vpn-gw-01', 'vpn'),
+    ('2026-03-09T13:40:50Z', 'gina', '10.20.3.31', 'file_access', 'success', 'fs-01', 'fileshare'),
+    ('2026-03-09T13:40:53Z', 'carla', '10.20.1.13', 'password_change', 'success', 'vpn-gw-01', 'vpn'),
+    ('2026-03-09T13:41:00Z', 'carla', '198.51.100.77', 'login', 'failure', 'vpn-gw-01', 'vpn'),
+    ('2026-03-09T13:41:20Z', 'carla', '198.51.100.77', 'login', 'failure', 'vpn-gw-01', 'vpn'),
+    ('2026-03-09T13:41:40Z', 'carla', '198.51.100.77', 'login', 'failure', 'vpn-gw-01', 'vpn'),
+    ('2026-03-09T13:42:00Z', 'jonas', '10.20.4.41', 'file_access', 'failure', 'fs-01', 'fileshare'),
+    ('2026-03-09T13:42:00Z', 'carla', '198.51.100.77', 'login', 'failure', 'vpn-gw-01', 'vpn'),
+    ('2026-03-09T13:42:20Z', 'carla', '198.51.100.77', 'login', 'failure', 'vpn-gw-01', 'vpn'),
+    ('2026-03-09T13:42:40Z', 'carla', '198.51.100.77', 'login', 'failure', 'vpn-gw-01', 'vpn'),
+    ('2026-03-09T13:43:00Z', 'carla', '198.51.100.77', 'login', 'failure', 'vpn-gw-01', 'vpn'),
+    ('2026-03-09T13:43:20Z', 'carla', '198.51.100.77', 'login', 'failure', 'vpn-gw-01', 'vpn'),
+    ('2026-03-09T13:43:40Z', 'carla', '198.51.100.77', 'login', 'failure', 'vpn-gw-01', 'vpn'),
+    ('2026-03-09T13:43:46Z', 'karim', '10.20.4.42', 'file_access', 'success', 'fs-01', 'fileshare'),
+    ('2026-03-09T13:44:25Z', 'carla', '198.51.100.77', 'login', 'success', 'vpn-gw-01', 'vpn'),
+    ('2026-03-09T13:45:25Z', 'carla', '198.51.100.77', 'file_access', 'success', 'fs-01', 'fileshare'),
+    ('2026-03-09T13:47:25Z', 'carla', '198.51.100.77', 'file_access', 'success', 'fs-01', 'fileshare'),
+    ('2026-03-09T13:47:30Z', 'irene', '10.20.3.33', 'file_access', 'success', 'fs-01', 'fileshare'),
+    ('2026-03-09T13:48:30Z', 'irene', '10.20.3.33', 'file_access', 'success', 'fs-01', 'fileshare'),
+    ('2026-03-09T13:50:22Z', 'hugo', '10.20.3.32', 'file_access', 'failure', 'fs-01', 'fileshare'),
+    ('2026-03-09T13:58:31Z', 'lucia', '10.20.4.43', 'file_access', 'success', 'fs-01', 'fileshare'),
+    ('2026-03-09T14:07:30Z', 'irene', '10.20.3.33', 'file_access', 'success', 'fs-01', 'fileshare'),
+    ('2026-03-09T14:09:55Z', 'alice', '10.20.1.11', 'file_access', 'success', 'fs-01', 'fileshare'),
+    ('2026-03-09T14:15:20Z', 'admin', '10.20.9.5', 'file_access', 'success', 'fs-01', 'fileshare'),
+    ('2026-03-09T14:16:53Z', 'carla', '10.20.1.13', 'file_access', 'failure', 'fs-01', 'fileshare'),
+    ('2026-03-09T14:17:18Z', 'farid', '10.20.2.23', 'file_access', 'success', 'fs-01', 'fileshare'),
+    ('2026-03-09T14:41:18Z', 'farid', '10.20.2.23', 'file_access', 'success', 'fs-01', 'fileshare'),
+    ('2026-03-09T14:44:00Z', 'jonas', '10.20.4.41', 'file_access', 'success', 'fs-01', 'fileshare'),
+    ('2026-03-09T14:46:46Z', 'karim', '10.20.4.42', 'file_access', 'failure', 'fs-01', 'fileshare'),
+    ('2026-03-09T14:49:53Z', 'carla', '10.20.1.13', 'file_access', 'success', 'fs-01', 'fileshare'),
+    ('2026-03-09T14:58:30Z', 'irene', '10.20.3.33', 'file_access', 'failure', 'fs-01', 'fileshare'),
+    ('2026-03-09T15:02:30Z', 'irene', '10.20.3.33', 'file_access', 'success', 'fs-01', 'fileshare'),
+    ('2026-03-09T15:07:30Z', 'irene', '10.20.3.33', 'file_access', 'success', 'fs-01', 'fileshare'),
+    ('2026-03-09T15:07:46Z', 'karim', '10.20.4.42', 'file_access', 'success', 'fs-01', 'fileshare'),
+    ('2026-03-09T15:10:18Z', 'farid', '10.20.2.23', 'file_access', 'failure', 'fs-01', 'fileshare'),
+    ('2026-03-09T15:10:50Z', 'gina', '10.20.3.31', 'file_access', 'success', 'fs-01', 'fileshare'),
+    ('2026-03-09T15:19:18Z', 'farid', '10.20.2.23', 'file_access', 'success', 'fs-01', 'fileshare'),
+    ('2026-03-09T15:23:22Z', 'hugo', '10.20.3.32', 'file_access', 'success', 'fs-01', 'fileshare'),
+    ('2026-03-09T15:28:55Z', 'alice', '10.20.1.11', 'file_access', 'success', 'fs-01', 'fileshare'),
+    ('2026-03-09T15:29:00Z', 'jonas', '10.20.4.41', 'file_access', 'success', 'fs-01', 'fileshare'),
+    ('2026-03-09T15:45:00Z', 'jonas', '10.20.4.41', 'file_access', 'success', 'fs-01', 'fileshare'),
+    ('2026-03-09T15:48:46Z', 'karim', '10.20.4.42', 'file_access', 'success', 'fs-01', 'fileshare'),
+    ('2026-03-09T15:54:20Z', 'admin', '10.20.9.5', 'file_access', 'success', 'fs-01', 'fileshare'),
+    ('2026-03-09T15:54:20Z', 'admin', '10.20.9.5', 'file_access', 'success', 'fs-01', 'fileshare'),
+    ('2026-03-09T16:28:30Z', 'irene', '10.20.3.33', 'file_access', 'success', 'fs-01', 'fileshare'),
+    ('2026-03-09T16:41:00Z', 'diego', '10.20.2.21', 'logout', 'success', 'rdp-gw-01', 'rdp'),
+    ('2026-03-09T16:42:00Z', 'lucia', '10.20.4.43', 'logout', 'success', 'vpn-gw-01', 'vpn'),
+    ('2026-03-09T16:50:00Z', 'irene', '10.20.3.33', 'logout', 'success', 'vpn-gw-01', 'vpn'),
+    ('2026-03-09T16:55:00Z', 'carla', '10.20.1.13', 'logout', 'success', 'vpn-gw-01', 'vpn'),
+    ('2026-03-09T17:09:00Z', 'helpdesk', '10.20.5.8', 'logout', 'success', 'mail-01', 'webmail'),
+    ('2026-03-09T17:13:00Z', 'gina', '10.20.3.31', 'logout', 'success', 'mail-01', 'webmail'),
+    ('2026-03-09T17:39:00Z', 'karim', '10.20.4.42', 'logout', 'success', 'rdp-gw-01', 'rdp'),
+    ('2026-03-09T17:46:00Z', 'hugo', '10.20.3.32', 'logout', 'success', 'rdp-gw-01', 'rdp'),
+    ('2026-03-09T17:51:00Z', 'elena', '10.20.2.22', 'logout', 'success', 'mail-01', 'webmail'),
+    ('2026-03-09T17:58:00Z', 'jonas', '10.20.4.41', 'logout', 'success', 'mail-01', 'webmail'),
+    ('2026-03-09T17:59:00Z', 'alice', '10.20.1.11', 'logout', 'success', 'vpn-gw-01', 'vpn'),
+    ('2026-03-09T18:05:00Z', 'farid', '10.20.2.23', 'logout', 'success', 'vpn-gw-01', 'vpn'),
+    ('2026-03-09T18:22:00Z', 'admin', '10.20.9.5', 'logout', 'success', 'bastion-01', 'ssh'),
+    ('2026-03-09T18:30:00Z', 'bruno', '10.20.1.12', 'logout', 'success', 'mail-01', 'webmail'),
+    ('2026-03-10T00:10:00Z', 'helpdesk', '203.0.113.120', 'login', 'failure', 'mail-01', 'webmail'),
+    ('2026-03-10T00:30:00Z', 'helpdesk', '203.0.113.120', 'login', 'failure', 'mail-01', 'webmail'),
+    ('2026-03-10T00:50:00Z', 'helpdesk', '203.0.113.120', 'login', 'failure', 'mail-01', 'webmail'),
+    ('2026-03-10T01:00:28Z', 'svc_backup', '10.20.9.20', 'login', 'success', 'bastion-01', 'ssh'),
+    ('2026-03-10T01:02:28Z', 'svc_backup', '10.20.9.20', 'file_access', 'success', 'fs-01', 'fileshare'),
+    ('2026-03-10T01:10:00Z', 'helpdesk', '203.0.113.120', 'login', 'failure', 'mail-01', 'webmail'),
+    ('2026-03-10T01:30:00Z', 'helpdesk', '203.0.113.120', 'login', 'failure', 'mail-01', 'webmail'),
+    ('2026-03-10T01:30:28Z', 'svc_backup', '10.20.9.20', 'logout', 'success', 'bastion-01', 'ssh'),
+    ('2026-03-10T01:50:00Z', 'helpdesk', '203.0.113.120', 'login', 'failure', 'mail-01', 'webmail'),
+    ('2026-03-10T02:10:00Z', 'helpdesk', '203.0.113.120', 'login', 'failure', 'mail-01', 'webmail'),
+    ('2026-03-10T02:30:00Z', 'helpdesk', '203.0.113.120', 'login', 'failure', 'mail-01', 'webmail'),
+    ('2026-03-10T02:50:00Z', 'helpdesk', '203.0.113.120', 'login', 'failure', 'mail-01', 'webmail'),
+    ('2026-03-10T03:05:10Z', 'alice', '192.0.2.99', 'login', 'failure', 'mail-01', 'webmail'),
+    ('2026-03-10T03:05:45Z', 'bruno', '192.0.2.99', 'login', 'failure', 'mail-01', 'webmail'),
+    ('2026-03-10T03:06:20Z', 'carla', '192.0.2.99', 'login', 'failure', 'mail-01', 'webmail'),
+    ('2026-03-10T03:06:55Z', 'diego', '192.0.2.99', 'login', 'failure', 'mail-01', 'webmail'),
+    ('2026-03-10T03:07:30Z', 'elena', '192.0.2.99', 'login', 'failure', 'mail-01', 'webmail'),
+    ('2026-03-10T03:08:05Z', 'farid', '192.0.2.99', 'login', 'failure', 'mail-01', 'webmail'),
+    ('2026-03-10T03:08:40Z', 'gina', '192.0.2.99', 'login', 'failure', 'mail-01', 'webmail'),
+    ('2026-03-10T03:09:15Z', 'hugo', '192.0.2.99', 'login', 'failure', 'mail-01', 'webmail'),
+    ('2026-03-10T03:09:50Z', 'alice', '192.0.2.99', 'login', 'failure', 'mail-01', 'webmail'),
+    ('2026-03-10T03:10:00Z', 'helpdesk', '203.0.113.120', 'login', 'failure', 'mail-01', 'webmail'),
+    ('2026-03-10T03:10:25Z', 'bruno', '192.0.2.99', 'login', 'failure', 'mail-01', 'webmail'),
+    ('2026-03-10T03:11:00Z', 'carla', '192.0.2.99', 'login', 'failure', 'mail-01', 'webmail'),
+    ('2026-03-10T03:11:35Z', 'diego', '192.0.2.99', 'login', 'failure', 'mail-01', 'webmail'),
+    ('2026-03-10T03:12:10Z', 'elena', '192.0.2.99', 'login', 'failure', 'mail-01', 'webmail'),
+    ('2026-03-10T03:12:10Z', 'elena', '192.0.2.99', 'login', 'failure', 'mail-01', 'webmail'),
+    ('2026-03-10T03:12:45Z', 'farid', '192.0.2.99', 'login', 'failure', 'mail-01', 'webmail'),
+    ('2026-03-10T03:12:45Z', 'farid', '192.0.2.99', 'login', 'failure', 'mail-01', 'webmail'),
+    ('2026-03-10T03:13:20Z', 'gina', '192.0.2.99', 'login', 'failure', 'mail-01', 'webmail'),
+    ('2026-03-10T03:13:55Z', 'hugo', '192.0.2.99', 'login', 'failure', 'mail-01', 'webmail'),
+    ('2026-03-10T03:30:00Z', 'helpdesk', '203.0.113.120', 'login', 'failure', 'mail-01', 'webmail'),
+    ('2026-03-10T03:50:00Z', 'helpdesk', '203.0.113.120', 'login', 'failure', 'mail-01', 'webmail'),
+    ('2026-03-10T04:10:00Z', 'helpdesk', '203.0.113.120', 'login', 'failure', 'mail-01', 'webmail'),
+    ('2026-03-10T04:30:00Z', 'helpdesk', '203.0.113.120', 'login', 'failure', 'mail-01', 'webmail'),
+    ('2026-03-10T04:50:00Z', 'helpdesk', '203.0.113.120', 'login', 'failure', 'mail-01', 'webmail'),
+    ('2026-03-10T05:10:00Z', 'helpdesk', '203.0.113.120', 'login', 'failure', 'mail-01', 'webmail'),
+    ('2026-03-10T05:30:00Z', 'helpdesk', '203.0.113.120', 'login', 'failure', 'mail-01', 'webmail'),
+    ('2026-03-10T05:50:00Z', 'helpdesk', '203.0.113.120', 'login', 'failure', 'mail-01', 'webmail'),
+    ('2026-03-10T08:12:43Z', 'jonas', '10.20.4.41', 'login', 'success', 'mail-01', 'webmail'),
+    ('2026-03-10T08:30:00Z', 'irene', '10.20.3.33', 'login', 'success', 'vpn-gw-01', 'vpn'),
+    ('2026-03-10T08:45:43Z', 'jonas', '10.20.4.41', 'file_access', 'success', 'fs-01', 'fileshare'),
+    ('2026-03-10T08:48:49Z', 'gina', '10.20.3.31', 'login', 'success', 'mail-01', 'webmail'),
+    ('2026-03-10T09:02:59Z', 'admin', '10.20.9.5', 'login', 'success', 'bastion-01', 'ssh'),
+    ('2026-03-10T09:08:03Z', 'elena', '10.20.2.22', 'login', 'success', 'mail-01', 'webmail'),
+    ('2026-03-10T09:20:03Z', 'elena', '10.20.2.22', 'file_access', 'success', 'fs-01', 'fileshare'),
+    ('2026-03-10T09:20:03Z', 'elena', '10.20.2.22', 'file_access', 'success', 'fs-01', 'fileshare'),
+    ('2026-03-10T09:20:21Z', 'lucia', '10.20.4.43', 'login', 'failure', 'vpn-gw-01', 'vpn'),
+    ('2026-03-10T09:21:03Z', 'elena', '10.20.2.22', 'file_access', 'success', 'fs-01', 'fileshare'),
+    ('2026-03-10T09:21:11Z', 'lucia', '10.20.4.43', 'login', 'success', 'vpn-gw-01', 'vpn'),
+    ('2026-03-10T09:22:50Z', 'hugo', '10.20.3.32', 'login', 'failure', 'rdp-gw-01', 'rdp'),
+    ('2026-03-10T09:23:23Z', 'hugo', '10.20.3.32', 'login', 'success', 'rdp-gw-01', 'rdp'),
+    ('2026-03-10T09:31:59Z', 'admin', '10.20.9.5', 'file_access', 'success', 'fs-01', 'fileshare'),
+    ('2026-03-10T09:35:03Z', 'elena', '10.20.2.22', 'file_access', 'success', 'fs-01', 'fileshare'),
+    ('2026-03-10T09:44:08Z', 'carla', '10.20.1.13', 'login', 'success', 'vpn-gw-01', 'vpn'),
+    ('2026-03-10T09:46:22Z', 'diego', '10.20.2.21', 'login', 'success', 'rdp-gw-01', 'rdp'),
+    ('2026-03-10T09:47:20Z', 'helpdesk', '10.20.5.8', 'login', 'success', 'mail-01', 'webmail'),
+    ('2026-03-10T09:48:03Z', 'elena', '10.20.2.22', 'file_access', 'success', 'fs-01', 'fileshare'),
+    ('2026-03-10T09:49:59Z', 'admin', '10.20.9.5', 'file_access', 'success', 'fs-01', 'fileshare'),
+    ('2026-03-10T09:50:20Z', 'helpdesk', '10.20.5.8', 'file_access', 'success', 'fs-01', 'fileshare'),
+    ('2026-03-10T09:51:00Z', 'bruno', '10.20.1.12', 'login', 'success', 'mail-01', 'webmail'),
+    ('2026-03-10T09:51:00Z', 'irene', '10.20.3.33', 'file_access', 'success', 'fs-01', 'fileshare'),
+    ('2026-03-10T09:55:22Z', 'diego', '10.20.2.21', 'file_access', 'success', 'fs-01', 'fileshare'),
+    ('2026-03-10T09:56:00Z', 'bruno', '10.20.1.12', 'file_access', 'success', 'fs-01', 'fileshare'),
+    ('2026-03-10T09:58:43Z', 'farid', '10.20.2.23', 'login', 'success', 'vpn-gw-01', 'vpn'),
+    ('2026-03-10T10:01:11Z', 'lucia', '10.20.4.43', 'file_access', 'success', 'fs-01', 'fileshare'),
+    ('2026-03-10T10:11:20Z', 'helpdesk', '10.20.5.8', 'file_access', 'success', 'fs-01', 'fileshare'),
+    ('2026-03-10T10:14:00Z', 'irene', '10.20.3.33', 'file_access', 'success', 'fs-01', 'fileshare'),
+    ('2026-03-10T10:16:59Z', 'alice', '10.20.1.11', 'login', 'success', 'vpn-gw-01', 'vpn'),
+    ('2026-03-10T10:26:23Z', 'hugo', '10.20.3.32', 'file_access', 'success', 'fs-01', 'fileshare'),
+    ('2026-03-10T10:28:08Z', 'karim', '10.20.4.42', 'login', 'success', 'rdp-gw-01', 'rdp'),
+    ('2026-03-10T10:30:03Z', 'elena', '10.20.2.22', 'file_access', 'success', 'fs-01', 'fileshare'),
+    ('2026-03-10T10:33:00Z', 'bruno', '10.20.1.12', 'file_access', 'success', 'fs-01', 'fileshare'),
+    ('2026-03-10T10:36:11Z', 'lucia', '10.20.4.43', 'file_access', 'success', 'fs-01', 'fileshare'),
+    ('2026-03-10T10:38:08Z', 'karim', '10.20.4.42', 'file_access', 'success', 'fs-01', 'fileshare'),
+    ('2026-03-10T10:38:11Z', 'lucia', '10.20.4.43', 'file_access', 'success', 'fs-01', 'fileshare'),
+    ('2026-03-10T10:39:43Z', 'farid', '10.20.2.23', 'file_access', 'failure', 'fs-01', 'fileshare'),
+    ('2026-03-10T10:39:59Z', 'admin', '10.20.9.5', 'file_access', 'success', 'fs-01', 'fileshare'),
+    ('2026-03-10T10:50:03Z', 'elena', '10.20.2.22', 'file_access', 'success', 'fs-01', 'fileshare'),
+    ('2026-03-10T10:50:08Z', 'carla', '10.20.1.13', 'file_access', 'success', 'fs-01', 'fileshare'),
+    ('2026-03-10T10:55:49Z', 'gina', '10.20.3.31', 'file_access', 'success', 'fs-01', 'fileshare'),
+    ('2026-03-10T10:56:00Z', 'bruno', '10.20.1.12', 'file_access', 'success', 'fs-01', 'fileshare'),
+    ('2026-03-10T11:00:22Z', 'diego', '10.20.2.21', 'file_access', 'failure', 'fs-01', 'fileshare'),
+    ('2026-03-10T11:01:08Z', 'carla', '10.20.1.13', 'file_access', 'success', 'fs-01', 'fileshare'),
+    ('2026-03-10T11:02:00Z', 'irene', '10.20.3.33', 'file_access', 'success', 'fs-01', 'fileshare'),
+    ('2026-03-10T11:04:00Z', 'irene', '10.20.3.33', 'file_access', 'success', 'fs-01', 'fileshare'),
+    ('2026-03-10T11:04:22Z', 'diego', '10.20.2.21', 'file_access', 'success', 'fs-01', 'fileshare'),
+    ('2026-03-10T11:06:23Z', 'hugo', '10.20.3.32', 'file_access', 'success', 'fs-01', 'fileshare'),
+    ('2026-03-10T11:08:20Z', 'helpdesk', '10.20.5.8', 'file_access', 'success', 'fs-01', 'fileshare'),
+    ('2026-03-10T11:08:49Z', 'gina', '10.20.3.31', 'file_access', 'success', 'fs-01', 'fileshare'),
+    ('2026-03-10T11:20:20Z', 'helpdesk', '10.20.5.8', 'file_access', 'success', 'fs-01', 'fileshare'),
+    ('2026-03-10T11:22:22Z', 'diego', '10.20.2.21', 'file_access', 'success', 'fs-01', 'fileshare'),
+    ('2026-03-10T11:24:23Z', 'hugo', '10.20.3.32', 'file_access', 'success', 'fs-01', 'fileshare'),
+    ('2026-03-10T11:29:00Z', 'bruno', '10.20.1.12', 'file_access', 'success', 'fs-01', 'fileshare'),
+    ('2026-03-10T11:29:59Z', 'alice', '10.20.1.11', 'file_access', 'success', 'fs-01', 'fileshare'),
+    ('2026-03-10T11:34:20Z', 'helpdesk', '10.20.5.8', 'file_access', 'success', 'fs-01', 'fileshare'),
+    ('2026-03-10T11:34:59Z', 'alice', '10.20.1.11', 'file_access', 'success', 'fs-01', 'fileshare'),
+    ('2026-03-10T11:36:43Z', 'farid', '10.20.2.23', 'file_access', 'failure', 'fs-01', 'fileshare'),
+    ('2026-03-10T11:37:43Z', 'farid', '10.20.2.23', 'file_access', 'failure', 'fs-01', 'fileshare'),
+    ('2026-03-10T11:39:43Z', 'farid', '10.20.2.23', 'file_access', 'failure', 'fs-01', 'fileshare'),
+    ('2026-03-10T11:42:00Z', 'irene', '10.20.3.33', 'file_access', 'success', 'fs-01', 'fileshare'),
+    ('2026-03-10T11:43:59Z', 'admin', '10.20.9.5', 'file_access', 'success', 'fs-01', 'fileshare'),
+    ('2026-03-10T11:47:59Z', 'alice', '10.20.1.11', 'file_access', 'success', 'fs-01', 'fileshare'),
+    ('2026-03-10T11:53:00Z', 'irene', '10.20.3.33', 'file_access', 'success', 'fs-01', 'fileshare'),
+    ('2026-03-10T12:02:08Z', 'karim', '10.20.4.42', 'file_access', 'success', 'fs-01', 'fileshare'),
+    ('2026-03-10T12:07:00Z', 'bruno', '10.20.1.12', 'file_access', 'success', 'fs-01', 'fileshare'),
+    ('2026-03-10T12:09:00Z', 'bruno', '10.20.1.12', 'file_access', 'success', 'fs-01', 'fileshare'),
+    ('2026-03-10T12:10:20Z', 'helpdesk', '10.20.5.8', 'file_access', 'success', 'fs-01', 'fileshare'),
+    ('2026-03-10T12:10:20Z', 'helpdesk', '10.20.5.8', 'file_access', 'success', 'fs-01', 'fileshare'),
+    ('2026-03-10T12:10:23Z', 'hugo', '10.20.3.32', 'file_access', 'success', 'fs-01', 'fileshare'),
+    ('2026-03-10T12:14:00Z', 'irene', '10.20.3.33', 'file_access', 'success', 'fs-01', 'fileshare'),
+    ('2026-03-10T12:23:59Z', 'alice', '10.20.1.11', 'file_access', 'success', 'fs-01', 'fileshare'),
+    ('2026-03-10T12:25:43Z', 'jonas', '10.20.4.41', 'file_access', 'failure', 'fs-01', 'fileshare'),
+    ('2026-03-10T12:42:43Z', 'jonas', '10.20.4.41', 'file_access', 'success', 'fs-01', 'fileshare'),
+    ('2026-03-10T12:47:08Z', 'karim', '10.20.4.42', 'file_access', 'success', 'fs-01', 'fileshare'),
+    ('2026-03-10T12:48:43Z', 'farid', '10.20.2.23', 'file_access', 'success', 'fs-01', 'fileshare'),
+    ('2026-03-10T12:52:43Z', 'jonas', '10.20.4.41', 'file_access', 'success', 'fs-01', 'fileshare'),
+    ('2026-03-10T13:01:00Z', 'bruno', '10.20.1.12', 'file_access', 'success', 'fs-01', 'fileshare'),
+    ('2026-03-10T13:06:00Z', 'bruno', '10.20.1.12', 'file_access', 'success', 'fs-01', 'fileshare'),
+    ('2026-03-10T13:06:00Z', 'irene', '10.20.3.33', 'file_access', 'success', 'fs-01', 'fileshare'),
+    ('2026-03-10T13:11:22Z', 'diego', '10.20.2.21', 'file_access', 'success', 'fs-01', 'fileshare'),
+    ('2026-03-10T13:17:03Z', 'elena', '10.20.2.22', 'file_access', 'success', 'fs-01', 'fileshare'),
+    ('2026-03-10T13:20:08Z', 'karim', '10.20.4.42', 'file_access', 'failure', 'fs-01', 'fileshare'),
+    ('2026-03-10T13:20:23Z', 'hugo', '10.20.3.32', 'file_access', 'success', 'fs-01', 'fileshare'),
+    ('2026-03-10T13:21:08Z', 'carla', '10.20.1.13', 'file_access', 'success', 'fs-01', 'fileshare'),
+    ('2026-03-10T13:21:49Z', 'gina', '10.20.3.31', 'file_access', 'success', 'fs-01', 'fileshare'),
+    ('2026-03-10T13:25:22Z', 'diego', '10.20.2.21', 'file_access', 'success', 'fs-01', 'fileshare'),
+    ('2026-03-10T13:29:11Z', 'lucia', '10.20.4.43', 'file_access', 'success', 'fs-01', 'fileshare'),
+    ('2026-03-10T13:32:43Z', 'farid', '10.20.2.23', 'file_access', 'success', 'fs-01', 'fileshare'),
+    ('2026-03-10T13:34:11Z', 'lucia', '10.20.4.43', 'file_access', 'success', 'fs-01', 'fileshare'),
+    ('2026-03-10T13:41:00Z', 'irene', '10.20.3.33', 'file_access', 'success', 'fs-01', 'fileshare'),
+    ('2026-03-10T13:41:59Z', 'admin', '10.20.9.5', 'file_access', 'success', 'fs-01', 'fileshare'),
+    ('2026-03-10T13:41:59Z', 'admin', '10.20.9.5', 'file_access', 'success', 'fs-01', 'fileshare'),
+    ('2026-03-10T13:42:43Z', 'farid', '10.20.2.23', 'file_access', 'success', 'fs-01', 'fileshare'),
+    ('2026-03-10T13:43:08Z', 'karim', '10.20.4.42', 'file_access', 'success', 'fs-01', 'fileshare'),
+    ('2026-03-10T13:51:43Z', 'farid', '10.20.2.23', 'file_access', 'success', 'fs-01', 'fileshare'),
+    ('2026-03-10T13:51:43Z', 'jonas', '10.20.4.41', 'file_access', 'success', 'fs-01', 'fileshare'),
+    ('2026-03-10T14:05:03Z', 'elena', '10.20.2.22', 'file_access', 'success', 'fs-01', 'fileshare'),
+    ('2026-03-10T14:05:11Z', 'lucia', '10.20.4.43', 'file_access', 'success', 'fs-01', 'fileshare'),
+    ('2026-03-10T14:08:00Z', 'bruno', '10.20.1.12', 'file_access', 'success', 'fs-01', 'fileshare'),
+    ('2026-03-10T14:09:22Z', 'diego', '10.20.2.21', 'file_access', 'success', 'fs-01', 'fileshare'),
+    ('2026-03-10T14:13:59Z', 'admin', '10.20.9.5', 'file_access', 'success', 'fs-01', 'fileshare'),
+    ('2026-03-10T14:15:59Z', 'alice', '10.20.1.11', 'file_access', 'success', 'fs-01', 'fileshare'),
+    ('2026-03-10T14:18:22Z', 'diego', '10.20.2.21', 'file_access', 'success', 'fs-01', 'fileshare'),
+    ('2026-03-10T14:19:08Z', 'carla', '10.20.1.13', 'file_access', 'success', 'fs-01', 'fileshare'),
+    ('2026-03-10T14:19:08Z', 'carla', '10.20.1.13', 'file_access', 'success', 'fs-01', 'fileshare'),
+    ('2026-03-10T14:23:23Z', 'hugo', '10.20.3.32', 'file_access', 'success', 'fs-01', 'fileshare'),
+    ('2026-03-10T14:28:23Z', 'hugo', '10.20.3.32', 'file_access', 'success', 'fs-01', 'fileshare'),
+    ('2026-03-10T14:33:49Z', 'gina', '10.20.3.31', 'file_access', 'success', 'fs-01', 'fileshare'),
+    ('2026-03-10T14:35:59Z', 'alice', '10.20.1.11', 'file_access', 'success', 'fs-01', 'fileshare'),
+    ('2026-03-10T14:35:59Z', 'alice', '10.20.1.11', 'file_access', 'success', 'fs-01', 'fileshare'),
+    ('2026-03-10T14:35:59Z', 'alice', '10.20.1.11', 'file_access', 'success', 'fs-01', 'fileshare'),
+    ('2026-03-10T14:37:11Z', 'lucia', '10.20.4.43', 'file_access', 'success', 'fs-01', 'fileshare'),
+    ('2026-03-10T14:40:00Z', 'bruno', '10.20.1.12', 'file_access', 'success', 'fs-01', 'fileshare'),
+    ('2026-03-10T14:43:08Z', 'karim', '10.20.4.42', 'file_access', 'success', 'fs-01', 'fileshare'),
+    ('2026-03-10T14:44:11Z', 'lucia', '10.20.4.43', 'file_access', 'success', 'fs-01', 'fileshare'),
+    ('2026-03-10T14:46:23Z', 'hugo', '10.20.3.32', 'file_access', 'success', 'fs-01', 'fileshare'),
+    ('2026-03-10T14:47:59Z', 'admin', '10.20.9.5', 'file_access', 'success', 'fs-01', 'fileshare'),
+    ('2026-03-10T14:55:23Z', 'hugo', '10.20.3.32', 'file_access', 'success', 'fs-01', 'fileshare'),
+    ('2026-03-10T14:55:59Z', 'alice', '10.20.1.11', 'file_access', 'success', 'fs-01', 'fileshare'),
+    ('2026-03-10T14:57:59Z', 'alice', '10.20.1.11', 'file_access', 'success', 'fs-01', 'fileshare'),
+    ('2026-03-10T15:20:00Z', 'elena', '10.20.2.22', 'login', 'failure', 'mail-01', 'webmail'),
+    ('2026-03-10T15:20:15Z', 'elena', '10.20.2.22', 'login', 'failure', 'mail-01', 'webmail'),
+    ('2026-03-10T15:20:30Z', 'elena', '10.20.2.22', 'login', 'failure', 'mail-01', 'webmail'),
+    ('2026-03-10T15:20:55Z', 'elena', '10.20.2.22', 'login', 'success', 'mail-01', 'webmail'),
+    ('2026-03-10T15:39:43Z', 'farid', '10.20.2.23', 'file_access', 'success', 'fs-01', 'fileshare'),
+    ('2026-03-10T16:33:00Z', 'alice', '10.20.1.11', 'logout', 'success', 'vpn-gw-01', 'vpn'),
+    ('2026-03-10T16:36:00Z', 'helpdesk', '10.20.5.8', 'logout', 'success', 'mail-01', 'webmail'),
+    ('2026-03-10T16:37:00Z', 'diego', '10.20.2.21', 'logout', 'success', 'rdp-gw-01', 'rdp'),
+    ('2026-03-10T16:37:00Z', 'irene', '10.20.3.33', 'logout', 'success', 'vpn-gw-01', 'vpn'),
+    ('2026-03-10T16:56:00Z', 'elena', '10.20.2.22', 'logout', 'success', 'mail-01', 'webmail'),
+    ('2026-03-10T16:58:00Z', 'hugo', '10.20.3.32', 'logout', 'success', 'rdp-gw-01', 'rdp'),
+    ('2026-03-10T16:59:00Z', 'admin', '10.20.9.5', 'logout', 'success', 'bastion-01', 'ssh'),
+    ('2026-03-10T17:05:00Z', 'lucia', '10.20.4.43', 'logout', 'success', 'vpn-gw-01', 'vpn'),
+    ('2026-03-10T17:07:00Z', 'bruno', '10.20.1.12', 'logout', 'success', 'mail-01', 'webmail'),
+    ('2026-03-10T17:11:00Z', 'karim', '10.20.4.42', 'logout', 'success', 'rdp-gw-01', 'rdp'),
+    ('2026-03-10T17:31:00Z', 'carla', '10.20.1.13', 'logout', 'success', 'vpn-gw-01', 'vpn'),
+    ('2026-03-10T18:07:00Z', 'farid', '10.20.2.23', 'logout', 'success', 'vpn-gw-01', 'vpn'),
+    ('2026-03-10T18:15:00Z', 'gina', '10.20.3.31', 'logout', 'success', 'mail-01', 'webmail'),
+    ('2026-03-10T18:29:00Z', 'jonas', '10.20.4.41', 'logout', 'success', 'mail-01', 'webmail'),
+]
+
+# A deliberately messy CSV used to exercise the loader's data-quality handling:
+# alternative column names, mixed-case statuses, a duplicate row, an invalid
+# timestamp, a blank username, an invalid IP, an unknown status and a row with
+# too many fields.
+_MALFORMED_CSV = """Time,User,Src_IP,Action,Outcome,Host
+2026-03-09T09:00:01Z,alice,10.20.1.11,login,Success,vpn-gw-01
+2026-03-09T10:00:00Z,demo_user,198.51.100.50,login,FAILED,vpn-gw-01
+2026-03-09T10:00:20Z,demo_user,198.51.100.50,login,FAILED,vpn-gw-01
+2026-03-09T10:00:40Z,demo_user,198.51.100.50,login,FAILED,vpn-gw-01
+2026-03-09T10:01:00Z,demo_user,198.51.100.50,login,FAILED,vpn-gw-01
+2026-03-09T10:01:20Z,demo_user,198.51.100.50,login,FAILED,vpn-gw-01
+2026-03-09T10:01:40Z,demo_user,198.51.100.50,login,FAILED,vpn-gw-01
+2026-03-09T10:01:40Z,demo_user,198.51.100.50,login,FAILED,vpn-gw-01
+2026-03-09T10:02:10Z,demo_user,198.51.100.50,login,Success,vpn-gw-01
+not-a-date,alice,10.20.1.11,login,Success,vpn-gw-01
+2026-03-09T11:00:00Z,,10.20.1.12,login,Success,vpn-gw-01
+2026-03-09T11:05:00Z,bruno,999.1.1.1,login,Success,vpn-gw-01
+2026-03-09T11:10:00Z,carla,10.20.1.13,login,maybe,vpn-gw-01
+2026-03-09T11:15:00Z,diego,10.20.2.21,login,Success,vpn-gw-01,unexpected,extra,fields
+"""
+
+
+def _records() -> list[dict[str, str]]:
+    """Return the canonical events as an ordered list of field dictionaries."""
+    return [dict(zip(FIELDS, row)) for row in _EVENTS]
+
+
+def _csv_text() -> str:
+    """Serialise the events to CSV text using LF line endings and a trailing newline."""
+    buffer = io.StringIO()
+    writer = csv.DictWriter(buffer, fieldnames=list(FIELDS), lineterminator="\n")
+    writer.writeheader()
+    writer.writerows(_records())
+    return buffer.getvalue()
+
+
+def _json_text() -> str:
+    """Serialise the events to the committed JSON layout.
+
+    The array is indented by two spaces with each object kept on a single line,
+    which keeps the file readable while staying diff-friendly for one record.
+    """
+    lines = ["["]
+    records = _records()
+    for index, record in enumerate(records):
+        inline = json.dumps(record, ensure_ascii=False)
+        comma = "," if index < len(records) - 1 else ""
+        lines.append(f"  {inline}{comma}")
+    lines.append("]")
+    return "\n".join(lines) + "\n"
+
+
+def synthetic_csv_text() -> str:
+    """Return the built-in synthetic auth logs as CSV text.
+
+    Exposes the in-memory dataset so callers (e.g. the CLI fallback) can analyse
+    a realistic feed without any file on disk.
+    """
+    return _csv_text()
+
+
+def write_samples(data_dir: Path) -> list[Path]:
+    """Write the sample CSV, JSON and malformed CSV into ``data_dir``.
+
+    Args:
+        data_dir: Destination directory; created if it does not exist.
+
+    Returns:
+        The paths that were written, in a stable order.
+    """
+    data_dir = Path(data_dir)
+    data_dir.mkdir(parents=True, exist_ok=True)
+    outputs = {
+        "sample_auth_logs.csv": _csv_text(),
+        "sample_auth_logs.json": _json_text(),
+        "sample_malformed_demo.csv": _MALFORMED_CSV,
+    }
+    written: list[Path] = []
+    for name, text in outputs.items():
+        path = data_dir / name
+        path.write_text(text, encoding="utf-8", newline="")
+        written.append(path)
+    return written
+
+
+if __name__ == "__main__":
+    target = Path(__file__).resolve().parent.parent / "data"
+    for path in write_samples(target):
+        print(f"Wrote {path}")
